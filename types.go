@@ -29,6 +29,7 @@ type P2PNode struct {
 
 	DiscoveryPort int
 	BroadcastConn *net.UDPConn
+	BroadcastAddr string
 	MdnsServer    *mdns.Server
 
 	// Web GUI相关

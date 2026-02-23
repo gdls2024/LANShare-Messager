@@ -11,6 +11,7 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -1072,6 +1073,59 @@ func (node *P2PNode) createHTTPHandler() http.Handler {
 
 	// WebView2 运行时分享 - 供局域网内其他节点下载（支持本地文件夹和系统安装）
 	mux.HandleFunc("/webview2runtime", serveWebView2Runtime)
+
+	// 手动连接到指定节点
+	mux.HandleFunc("/connect", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req struct {
+			Address string `json:"address"`
+		}
+
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid JSON", http.StatusBadRequest)
+			return
+		}
+
+		if req.Address == "" {
+			http.Error(w, "地址不能为空", http.StatusBadRequest)
+			return
+		}
+
+		host, portStr, err := net.SplitHostPort(req.Address)
+		if err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{
+				"status":  "error",
+				"message": fmt.Sprintf("无效的地址格式: %s (应为 IP:端口)", req.Address),
+			})
+			return
+		}
+
+		port, err := strconv.Atoi(portStr)
+		if err != nil || port <= 0 || port > 65535 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{
+				"status":  "error",
+				"message": fmt.Sprintf("无效的端口号: %s", portStr),
+			})
+			return
+		}
+
+		tempID := fmt.Sprintf("manual_%s_%d", host, time.Now().Unix())
+		go node.connectToPeer(host, port, tempID, "unknown", 0)
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"status":  "ok",
+			"message": fmt.Sprintf("正在尝试连接到 %s", req.Address),
+		})
+	})
 
 	return mux
 }

@@ -7,8 +7,59 @@ import (
 	"time"
 )
 
+// 根据本地IP计算子网定向广播地址
+func getSubnetBroadcastAddr(localIP string) (string, error) {
+	targetIP := net.ParseIP(localIP)
+	if targetIP == nil {
+		return "255.255.255.255", fmt.Errorf("无法解析IP: %s", localIP)
+	}
+
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return "255.255.255.255", fmt.Errorf("获取网络接口失败: %v", err)
+	}
+
+	for _, iface := range interfaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			ipnet, ok := addr.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			if ipnet.IP.Equal(targetIP) {
+				ip := ipnet.IP.To4()
+				mask := ipnet.Mask
+				if ip == nil || len(mask) != 4 {
+					continue
+				}
+				broadcast := make(net.IP, 4)
+				for i := 0; i < 4; i++ {
+					broadcast[i] = ip[i] | ^mask[i]
+				}
+				return broadcast.String(), nil
+			}
+		}
+	}
+
+	return "255.255.255.255", fmt.Errorf("未找到匹配 %s 的网络接口", localIP)
+}
+
 // 启动服务发现
 func (node *P2PNode) startDiscovery() {
+	// 计算子网广播地址
+	broadcastAddr, err := getSubnetBroadcastAddr(node.LocalIP)
+	if err != nil {
+		Log.Warn("计算广播地址失败，使用 255.255.255.255", "error", err)
+	}
+	node.BroadcastAddr = broadcastAddr
+	Log.Info("使用广播地址", "addr", node.BroadcastAddr)
+
 	go node.listenBroadcast()
 	time.Sleep(500 * time.Millisecond)
 	// Send multiple rapid announces at startup for fast peer discovery
@@ -74,8 +125,16 @@ func (node *P2PNode) handleDiscoveryMessage(msg DiscoveryMessage, remoteAddr *ne
 
 	switch msg.Type {
 	case "announce":
-		fmt.Printf("发现新节点: %s (%s:%d)\n", msg.Name, msg.IP, msg.Port)
-		Log.Info("发现新节点", "name", msg.Name, "ip", msg.IP, "port", msg.Port)
+		if exists {
+			fmt.Printf("[发现] 重新发现已断开的节点: %s (%s:%d)\n", msg.Name, msg.IP, msg.Port)
+			Log.Info("重新发现已断开的节点", "name", msg.Name, "ip", msg.IP, "port", msg.Port)
+			node.PeersMutex.Lock()
+			delete(node.Peers, msg.ID)
+			node.PeersMutex.Unlock()
+		} else {
+			fmt.Printf("[发现] 发现新节点: %s (%s:%d)\n", msg.Name, msg.IP, msg.Port)
+			Log.Info("发现新节点", "name", msg.Name, "ip", msg.IP, "port", msg.Port)
+		}
 		// 确定性连接：只有ID较小的节点主动发起TCP连接，避免双向同时连接导致的重连循环
 		if node.ID < msg.ID {
 			go node.connectToPeer(msg.IP, msg.Port, msg.ID, msg.Name, msg.WebPort)
@@ -84,13 +143,21 @@ func (node *P2PNode) handleDiscoveryMessage(msg DiscoveryMessage, remoteAddr *ne
 		node.sendDiscoveryResponse(remoteAddr.IP.String())
 
 	case "response":
-		Log.Info("收到发现响应", "name", msg.Name, "ip", msg.IP)
+		if exists {
+			fmt.Printf("[发现] 收到已断开节点 %s 的响应，重新连接...\n", msg.Name)
+			Log.Info("收到已断开节点的响应", "name", msg.Name)
+			node.PeersMutex.Lock()
+			delete(node.Peers, msg.ID)
+			node.PeersMutex.Unlock()
+		} else {
+			Log.Info("收到发现响应", "name", msg.Name, "ip", msg.IP)
+		}
 		// 确定性连接：只有ID较小的节点主动发起TCP连接
 		if node.ID < msg.ID {
-			fmt.Printf("收到来自 %s 的响应，发起连接...\n", msg.Name)
+			fmt.Printf("[发现] 收到来自 %s 的响应，发起连接...\n", msg.Name)
 			go node.connectToPeer(msg.IP, msg.Port, msg.ID, msg.Name, msg.WebPort)
 		} else {
-			fmt.Printf("收到来自 %s 的响应，等待对方连接\n", msg.Name)
+			fmt.Printf("[发现] 收到来自 %s 的响应，等待对方连接\n", msg.Name)
 		}
 	}
 }
@@ -114,13 +181,26 @@ func (node *P2PNode) sendDiscoveryBroadcast(msgType string) {
 		return
 	}
 
-	broadcastAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("255.255.255.255:%d", node.DiscoveryPort))
+	// 使用子网定向广播地址
+	broadcastIP := node.BroadcastAddr
+	if broadcastIP == "" {
+		broadcastIP = "255.255.255.255"
+	}
+
+	broadcastAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", broadcastIP, node.DiscoveryPort))
 	if err != nil {
-		Log.Error("解析广播地址失败", "error", err)
+		Log.Error("解析广播地址失败", "addr", broadcastIP, "error", err)
 		return
 	}
 
-	conn, err := net.DialUDP("udp", nil, broadcastAddr)
+	// 绑定到选定的网卡
+	localAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:0", node.LocalIP))
+	if err != nil {
+		Log.Error("解析本地地址失败", "localIP", node.LocalIP, "error", err)
+		return
+	}
+
+	conn, err := net.DialUDP("udp", localAddr, broadcastAddr)
 	if err != nil {
 		Log.Error("创建UDP广播连接失败", "error", err)
 		return
@@ -131,7 +211,7 @@ func (node *P2PNode) sendDiscoveryBroadcast(msgType string) {
 	if err != nil {
 		Log.Error("发送广播失败", "error", err)
 	} else {
-		Log.Info("发送发现广播", "type", msgType, "localIP", node.LocalIP)
+		Log.Info("发送发现广播", "type", msgType, "localIP", node.LocalIP, "broadcastAddr", broadcastIP)
 	}
 }
 
@@ -158,7 +238,13 @@ func (node *P2PNode) sendDiscoveryResponse(targetIP string) {
 		return
 	}
 
-	conn, err := net.DialUDP("udp", nil, addr)
+	// 绑定到选定的网卡
+	localAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:0", node.LocalIP))
+	if err != nil {
+		return
+	}
+
+	conn, err := net.DialUDP("udp", localAddr, addr)
 	if err != nil {
 		return
 	}

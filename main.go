@@ -287,6 +287,7 @@ func (node *P2PNode) Start() error {
 		node.startWebGUI()
 	}
 	go node.startDiscovery()
+	go node.startMDNSDiscovery()
 	go node.handleMessages()
 	go node.acceptConnections()
 	go node.periodicBroadcast()
@@ -315,6 +316,7 @@ func (node *P2PNode) showCommandHelp() {
 	fmt.Println("  /block <用户名> - 屏蔽用户")
 	fmt.Println("  /unblock <用户名> - 解除屏蔽")
 	fmt.Println("  /acl - 查看屏蔽列表")
+	fmt.Println("  /connect <IP:端口> - 手动连接到指定节点")
 	fmt.Println("  /history [用户名] [数量] - 查看历史消息 (默认20条)")
 	fmt.Println("  /update - 从局域网获取最新版本")
 	fmt.Println("  /version - 显示版本信息")
@@ -707,6 +709,27 @@ func (node *P2PNode) handleCommand(command string) {
 			fmt.Println("无历史消息")
 		}
 		
+	case "/connect":
+		if len(parts) < 2 {
+			fmt.Println("用法: /connect <IP:端口>")
+			fmt.Println("示例: /connect 192.168.1.100:8888")
+			return
+		}
+		address := parts[1]
+		host, portStr, err := net.SplitHostPort(address)
+		if err != nil {
+			fmt.Printf("无效的地址格式: %s (应为 IP:端口)\n", address)
+			return
+		}
+		port, err := strconv.Atoi(portStr)
+		if err != nil || port <= 0 || port > 65535 {
+			fmt.Printf("无效的端口号: %s\n", portStr)
+			return
+		}
+		fmt.Printf("正在尝试连接到 %s...\n", address)
+		tempID := fmt.Sprintf("manual_%s_%d", host, time.Now().Unix())
+		go node.connectToPeer(host, port, tempID, "unknown", 0)
+
 	default:
 		fmt.Printf("未知命令: %s\n", parts[0])
 	}
@@ -756,6 +779,9 @@ func (node *P2PNode) Stop() {
 	default:
 		close(node.StopCh)
 	}
+
+	// 停止mDNS服务
+	node.stopMDNS()
 
 	if node.Listener != nil {
 		node.Listener.Close()
