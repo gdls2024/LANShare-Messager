@@ -19,21 +19,17 @@ func generateFileID() string {
 	return hex.EncodeToString(bytes)
 }
 
-// 发送文件传输请求
-func (node *P2PNode) sendFileTransferRequest(filePath string, targetName string) {
+// 发送文件传输请求，返回生成的 fileID（失败时返回空字符串）
+func (node *P2PNode) sendFileTransferRequest(filePath string, targetName string) string {
 	// 检查文件是否存在
 	fileInfo, err := os.Stat(filePath)
 	if err != nil {
 		fmt.Printf("文件不存在或无法访问: %s\n", filePath)
-		return
+		Log.Error("文件不存在或无法访问", "path", filePath, "error", err)
+		return ""
 	}
 
 	// 检查文件大小
-	if fileInfo.Size() > 100*1024*1024 { // 100MB限制
-		fmt.Printf("文件大小超过限制 (最大100MB): %s\n", formatFileSize(fileInfo.Size()))
-		return
-	}
-
 	// 查找目标用户
 	var targetID string
 	node.PeersMutex.RLock()
@@ -47,7 +43,7 @@ func (node *P2PNode) sendFileTransferRequest(filePath string, targetName string)
 
 	if targetID == "" {
 		fmt.Printf("用户 %s 不在线\n", targetName)
-		return
+		return ""
 	}
 
 	// 生成文件ID
@@ -80,8 +76,9 @@ func (node *P2PNode) sendFileTransferRequest(filePath string, targetName string)
 	}
 	node.FileTransfersMutex.Unlock()
 
-	fmt.Printf("向 %s 发送文件传输请求: %s (%s)\n", 
+	fmt.Printf("向 %s 发送文件传输请求: %s (%s)\n",
 		targetName, request.FileName, formatFileSize(request.FileSize))
+	Log.Info("发送文件传输请求", "target", targetName, "fileName", request.FileName, "fileSize", request.FileSize)
 
 	// 发送请求
 	if peer, exists := node.Peers[targetID]; exists {
@@ -94,6 +91,8 @@ func (node *P2PNode) sendFileTransferRequest(filePath string, targetName string)
 		}
 		node.sendMessageToPeer(peer, msg)
 	}
+
+	return fileID
 }
 
 // 处理文件传输请求
@@ -160,6 +159,7 @@ func (node *P2PNode) respondToFileTransfer(fileID string, accepted bool) {
 	if accepted {
 		responseMsg.Message = "文件传输已接受"
 		fmt.Printf("已接受文件传输，准备接收文件...\n")
+		Log.Info("接受文件传输", "fileID", fileID, "from", transfer.PeerName, "fileName", transfer.FileName)
 		node.FileTransfersMutex.Lock()
 		transfer.Status = "transferring"
 		node.FileTransfersMutex.Unlock()
@@ -223,6 +223,7 @@ func (node *P2PNode) sendFile(fileID string, filePath string) {
 	if !exists {
 		node.FileTransfersMutex.RUnlock()
 		fmt.Printf("发送文件失败: 无效的文件ID %s\n", fileID)
+		Log.Error("发送文件失败: 无效的文件ID", "fileID", fileID)
 		return
 	}
 	targetName := transfer.PeerName
@@ -240,6 +241,13 @@ func (node *P2PNode) sendFile(fileID string, filePath string) {
 
 	if targetPeer == nil {
 		fmt.Printf("发送文件失败: 用户 %s 不在线\n", targetName)
+		Log.Error("发送文件失败: 用户不在线", "target", targetName)
+		node.FileTransfersMutex.Lock()
+		if t, ok := node.FileTransfers[fileID]; ok {
+			t.Status = "failed"
+			t.EndTime = time.Now()
+		}
+		node.FileTransfersMutex.Unlock()
 		return
 	}
 
@@ -247,6 +255,13 @@ func (node *P2PNode) sendFile(fileID string, filePath string) {
 	file, err := os.Open(filePath)
 	if err != nil {
 		fmt.Printf("发送文件失败: 无法打开文件 %s: %v\n", filePath, err)
+		Log.Error("无法打开文件", "path", filePath, "error", err)
+		node.FileTransfersMutex.Lock()
+		if t, ok := node.FileTransfers[fileID]; ok {
+			t.Status = "failed"
+			t.EndTime = time.Now()
+		}
+		node.FileTransfersMutex.Unlock()
 		return
 	}
 	defer file.Close()
@@ -258,12 +273,23 @@ func (node *P2PNode) sendFile(fileID string, filePath string) {
 	chunkNum := 0
 
 	for {
+		// Check if transfer was cancelled
+		node.FileTransfersMutex.RLock()
+		if transfer.Status == "cancelled" {
+			node.FileTransfersMutex.RUnlock()
+			fmt.Printf("文件传输已取消: %s\n", transfer.FileName)
+			Log.Info("文件传输已取消", "fileID", fileID)
+			return
+		}
+		node.FileTransfersMutex.RUnlock()
+
 		bytesRead, err := file.Read(buffer)
 		if err != nil {
 			if err == io.EOF {
 				break // 文件读取完毕
 			}
 			fmt.Printf("发送文件失败: 读取文件时出错: %v\n", err)
+			Log.Error("读取文件时出错", "path", filePath, "error", err)
 			return
 		}
 		if bytesRead == 0 {
@@ -292,6 +318,7 @@ func (node *P2PNode) sendFile(fileID string, filePath string) {
 				chunk.Data = nil // 清空明文
 			} else {
 				fmt.Printf("加密文件块失败: %v，将尝试不加密传输\n", err)
+				Log.Error("加密文件块失败", "fileID", fileID, "chunk", chunkNum, "error", err)
 				// 如果加密失败，保持明文传输
 				chunk.Encrypted = false
 				chunk.Data = chunkData
@@ -311,6 +338,7 @@ func (node *P2PNode) sendFile(fileID string, filePath string) {
 
 		if err := node.sendMessageToPeer(targetPeer, msg); err != nil {
 			fmt.Printf("发送文件块失败: %v\n", err)
+			Log.Error("发送文件块失败", "fileID", fileID, "chunk", chunkNum, "error", err)
 			// 标记传输失败
 			node.FileTransfersMutex.Lock()
 			if transfer, exists := node.FileTransfers[fileID]; exists {
@@ -324,17 +352,21 @@ func (node *P2PNode) sendFile(fileID string, filePath string) {
 
 		// 更新进度
 		node.updateTransferProgress(fileID, int64(bytesRead))
+
+		// Log progress every 100 chunks (~6.4MB)
+		if chunkNum%100 == 0 || chunkNum == totalChunks {
+			node.FileTransfersMutex.RLock()
+			pct := float64(transfer.Progress) / float64(transfer.FileSize) * 100
+			node.FileTransfersMutex.RUnlock()
+			Log.Info("发送进度", "fileID", fileID, "chunk", chunkNum, "total", totalChunks,
+				"progress", fmt.Sprintf("%.1f%%", pct))
+		}
 	}
 
-	// 发送完成
-	node.FileTransfersMutex.Lock()
-	if transfer, exists := node.FileTransfers[fileID]; exists {
-		transfer.Status = "completed"
-		transfer.EndTime = time.Now()
-	}
-	node.FileTransfersMutex.Unlock()
-
-	fmt.Printf("文件发送完成: %s\n", filePath)
+	// 所有块已写入TCP，等待接收方确认（status仍为transferring）
+	// 接收方完成后会发送 file_complete 消息，handleFileComplete 才标记为 completed
+	fmt.Printf("文件已发送到网络，等待对方确认: %s\n", filePath)
+	Log.Info("文件块全部发送", "path", filePath, "fileID", fileID)
 }
 
 // 处理文件数据块
@@ -348,9 +380,10 @@ func (node *P2PNode) handleFileChunk(chunk FileChunk) {
 	node.FileTransfersMutex.Unlock()
 
 	// 创建下载目录
-	downloadDir := "downloads"
+	downloadDir := DataPath("downloads")
 	if err := os.MkdirAll(downloadDir, 0755); err != nil {
 		fmt.Printf("创建下载目录失败: %v\n", err)
+		Log.Error("创建下载目录失败", "error", err)
 		return
 	}
 
@@ -360,6 +393,7 @@ func (node *P2PNode) handleFileChunk(chunk FileChunk) {
 	file, err := os.OpenFile(filePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		fmt.Printf("打开文件失败: %v\n", err)
+		Log.Error("打开接收文件失败", "path", filePath, "error", err)
 		return
 	}
 	defer file.Close()
@@ -378,6 +412,7 @@ func (node *P2PNode) handleFileChunk(chunk FileChunk) {
 			} else {
 				fmt.Printf("解密文件块失败: %v (文件: %s, 发送方: %s, PeerID: %s)\n",
 					err, transfer.FileName, transfer.PeerName, transfer.PeerID)
+				Log.Error("解密文件块失败", "fileName", transfer.FileName, "peer", transfer.PeerName, "error", err)
 				fmt.Printf("调试信息 - 密文长度: %d, Nonce长度: %d, 密钥长度: %d\n",
 					len(chunk.Ciphertext), len(chunk.Nonce), len(senderPeer.SharedKey))
 				return
@@ -404,20 +439,73 @@ func (node *P2PNode) handleFileChunk(chunk FileChunk) {
 	// 写入数据
 	if _, err := file.Write(chunkData); err != nil {
 		fmt.Printf("写入文件块失败: %v\n", err)
+		Log.Error("写入文件块失败", "fileID", chunk.FileID, "error", err)
 		return
 	}
 
 	// 更新进度
 	node.updateTransferProgress(chunk.FileID, int64(len(chunkData)))
 
+	// Log receive progress every 100 chunks (~6.4MB)
+	if chunk.ChunkNum%100 == 0 || chunk.ChunkNum == chunk.TotalChunks {
+		node.FileTransfersMutex.RLock()
+		pct := float64(transfer.Progress) / float64(transfer.FileSize) * 100
+		node.FileTransfersMutex.RUnlock()
+		Log.Info("接收进度", "fileID", chunk.FileID, "chunk", chunk.ChunkNum, "total", chunk.TotalChunks,
+			"progress", fmt.Sprintf("%.1f%%", pct))
+	}
+
 	// 检查是否完成
 	node.FileTransfersMutex.Lock()
 	if transfer.Progress >= transfer.FileSize {
 		transfer.Status = "completed"
 		transfer.EndTime = time.Now()
-		fmt.Printf("\n文件接收完成: %s，已保存到 %s 目录\n", transfer.FileName, downloadDir)
+		transfer.SavePath = filePath
+		fmt.Printf("\n文件接收完成: %s，已保存到 %s\n", transfer.FileName, filePath)
+		Log.Info("文件接收完成", "fileName", transfer.FileName, "savePath", filePath)
+
+		// 发送完成确认给发送方
+		peerID := transfer.PeerID
+		node.FileTransfersMutex.Unlock()
+		node.sendFileComplete(chunk.FileID, peerID)
+	} else {
+		node.FileTransfersMutex.Unlock()
 	}
-	node.FileTransfersMutex.Unlock()
+}
+
+// sendFileComplete sends a "file_complete" acknowledgment to the sender.
+func (node *P2PNode) sendFileComplete(fileID, peerID string) {
+	node.PeersMutex.RLock()
+	peer, exists := node.Peers[peerID]
+	node.PeersMutex.RUnlock()
+	if !exists {
+		return
+	}
+
+	msg := Message{
+		Type:    "file_complete",
+		From:    node.ID,
+		To:      peerID,
+		Content: fileID,
+	}
+	node.sendMessageToPeer(peer, msg)
+}
+
+// handleFileComplete processes a "file_complete" acknowledgment from the receiver.
+func (node *P2PNode) handleFileComplete(fileID string) {
+	node.FileTransfersMutex.Lock()
+	defer node.FileTransfersMutex.Unlock()
+
+	transfer, exists := node.FileTransfers[fileID]
+	if !exists || transfer.Direction != "send" {
+		return
+	}
+
+	transfer.Status = "completed"
+	transfer.Progress = transfer.FileSize // Ensure 100%
+	transfer.EndTime = time.Now()
+	fmt.Printf("文件传输完成确认: %s\n", transfer.FileName)
+	Log.Info("文件传输完成确认", "fileName", transfer.FileName, "fileID", fileID)
 }
 
 // 更新文件传输状态（计算速度和ETA）
@@ -469,6 +557,57 @@ func formatFileSize(size int64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.1f %cB", float64(size)/float64(div), "KMGTPE"[exp])
+}
+
+// 取消文件传输（发送方调用）
+func (node *P2PNode) cancelFileTransfer(fileID string) {
+	node.FileTransfersMutex.Lock()
+	transfer, exists := node.FileTransfers[fileID]
+	if !exists {
+		node.FileTransfersMutex.Unlock()
+		return
+	}
+	transfer.Status = "cancelled"
+	transfer.EndTime = time.Now()
+	peerName := transfer.PeerName
+	node.FileTransfersMutex.Unlock()
+
+	// Send cancel message to the other peer
+	var targetPeer *Peer
+	node.PeersMutex.RLock()
+	for _, p := range node.Peers {
+		if p.Name == peerName {
+			targetPeer = p
+			break
+		}
+	}
+	node.PeersMutex.RUnlock()
+
+	if targetPeer != nil {
+		msg := Message{
+			Type:      "file_cancel",
+			From:      node.ID,
+			To:        targetPeer.ID,
+			Timestamp: time.Now(),
+			Content:   fileID,
+		}
+		node.sendMessageToPeer(targetPeer, msg)
+	}
+
+	Log.Info("文件传输已取消", "fileID", fileID, "peer", peerName)
+}
+
+// 处理文件传输取消（接收方处理）
+func (node *P2PNode) handleFileTransferCancel(fileID string) {
+	node.FileTransfersMutex.Lock()
+	transfer, exists := node.FileTransfers[fileID]
+	if exists {
+		transfer.Status = "cancelled"
+		transfer.EndTime = time.Now()
+		fmt.Printf("对方已取消文件传输: %s\n", transfer.FileName)
+		Log.Info("对方已取消文件传输", "fileID", fileID, "fileName", transfer.FileName)
+	}
+	node.FileTransfersMutex.Unlock()
 }
 
 // 显示文件传输列表

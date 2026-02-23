@@ -9,10 +9,16 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/wailsapp/wails/v2"
+	"github.com/wailsapp/wails/v2/pkg/options"
+	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
+	"github.com/wailsapp/wails/v2/pkg/options/windows"
 )
 
 // 生成消息ID
@@ -26,39 +32,55 @@ func generateMessageID() string {
 
 // 创建新的P2P节点
 func NewP2PNode(name string, webEnabled bool, localIP string) *P2PNode {
+	t := time.Now()
 	if localIP == "" {
 		localIP = getLocalIP()
 	}
 	nodeID := fmt.Sprintf("%s_%d", localIP, time.Now().Unix())
 	address := fmt.Sprintf("%s:%d", localIP, 8888)
-	
+
+	// Generate node-level ECDH key pair (persistent for node lifetime)
+	tStep := time.Now()
+	nodePrivKey, nodePubKey, keyErr := generateECDHKeyPair()
+	if keyErr != nil {
+		Log.Error("节点密钥生成失败", "error", keyErr)
+	}
+	Log.Debug("ECDH密钥生成完成", "耗时", time.Since(tStep), "pubKeyLen", len(nodePubKey))
+
 	node := &P2PNode{
-		LocalIP:       localIP,
-		LocalPort:     8888,
-		Name:          name,
-		ID:            nodeID,
-		Address:       address,
-		Peers:         make(map[string]*Peer),
-		MessageChan:   make(chan Message, 100),
-		Running:       false,
-		DiscoveryPort: 9999,
-		WebPort:       8080,
-		Messages:      make([]ChatMessage, 0),
-		WebEnabled:    webEnabled,
-		FileTransfers: make(map[string]*FileTransferStatus),
-		ACLs:          make(map[string]map[string]bool),
-		ACLMutex:      sync.RWMutex{},
+		LocalIP:        localIP,
+		LocalPort:      8888,
+		Name:           name,
+		ID:             nodeID,
+		Address:        address,
+		NodePrivateKey: nodePrivKey,
+		NodePublicKey:  nodePubKey,
+		Peers:          make(map[string]*Peer),
+		MessageChan:    make(chan Message, 100),
+		StopCh:         make(chan struct{}),
+		Running:        false,
+		DiscoveryPort:  9999,
+		WebPort:        8080,
+		Messages:       make([]ChatMessage, 0),
+		WebEnabled:     webEnabled,
+		FileTransfers:  make(map[string]*FileTransferStatus),
+		ACLs:           make(map[string]map[string]bool),
+		ACLMutex:       sync.RWMutex{},
 	}
 
 	// 初始化数据库
-	db, err := sql.Open("sqlite3", "message.db")
+	dbPath := DataPath("message.db")
+	tStep = time.Now()
+	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
-		fmt.Printf("打开数据库失败: %v\n", err)
+		Log.Error("打开数据库失败", "error", err, "path", dbPath)
 		node.DB = nil
 		return node
 	}
 	node.DB = db
+	Log.Debug("sql.Open 完成", "耗时", time.Since(tStep), "path", dbPath)
 
+	tStep = time.Now()
 	_, err = db.Exec(`
 		CREATE TABLE IF NOT EXISTS messages (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -86,32 +108,49 @@ func NewP2PNode(name string, webEnabled bool, localIP string) *P2PNode {
 		CREATE INDEX IF NOT EXISTS idx_message_id ON messages(message_id);
 	`)
 	if err != nil {
-		fmt.Printf("创建数据库表失败: %v\n", err)
+		Log.Error("创建数据库表失败", "error", err)
 		db.Close()
 		node.DB = nil
 		return node
 	}
+	Log.Debug("CREATE TABLE 完成", "耗时", time.Since(tStep))
+
+	// Migration: add file_id column (fails silently if already exists)
+	db.Exec("ALTER TABLE messages ADD COLUMN file_id TEXT DEFAULT ''")
 
 	// 清理旧消息（保留30天）
-	_, err = db.Exec("DELETE FROM messages WHERE timestamp < DATETIME('now', '-30 days')")
+	tStep = time.Now()
+	result, err := db.Exec("DELETE FROM messages WHERE timestamp < DATETIME('now', '-30 days')")
 	if err != nil {
-		fmt.Printf("清理旧消息失败: %v\n", err)
+		Log.Error("清理旧消息失败", "error", err)
+	} else {
+		deleted, _ := result.RowsAffected()
+		Log.Debug("清理旧消息完成", "耗时", time.Since(tStep), "deleted", deleted)
 	}
 
 	// Now load history with proper key
+	tStep = time.Now()
 	node.loadHistoryFromDB()
+	Log.Debug("loadHistoryFromDB 完成", "耗时", time.Since(tStep), "loadedMessages", len(node.Messages))
 
 	// 设置 WAL 模式以提高并发
-	_, err = db.Exec("PRAGMA journal_mode=WAL;")
-	if err != nil {
-		fmt.Printf("设置 WAL 模式失败: %v\n", err)
-	}
-	_, err = db.Exec("PRAGMA journal_mode=WAL;")
-	if err != nil {
-		fmt.Printf("设置 WAL 模式失败: %v\n", err)
-	}
+	tStep = time.Now()
+	var walMode string
+	db.QueryRow("PRAGMA journal_mode=WAL;").Scan(&walMode)
+	Log.Debug("PRAGMA journal_mode=WAL", "耗时", time.Since(tStep), "result", walMode)
 
+	Log.Debug("NewP2PNode 完成", "总耗时", time.Since(t), "name", name, "localIP", localIP, "nodeID", nodeID)
 	return node
+}
+
+// clearHistoryIfDisabled clears the message DB on startup if save-history is disabled.
+// This handles cases where the app crashed before shutdown cleanup could run.
+func (node *P2PNode) clearHistoryIfDisabled() {
+	if node.Config != nil && !node.Config.IsSaveHistory() && node.DB != nil {
+		node.DB.Exec("DELETE FROM messages")
+		node.Messages = node.Messages[:0]
+		Log.Info("启动时清空聊天记录（保存聊天记录已关闭）")
+	}
 }
 
 // ACL 方法实现
@@ -199,38 +238,60 @@ func (node *P2PNode) showACL() {
 
 // 启动P2P节点
 func (node *P2PNode) Start() error {
-	// 启动TCP监听器
-	listener, err := net.Listen("tcp", fmt.Sprintf("%s:%d", node.LocalIP, node.LocalPort))
+	Log.Debug("node.Start() 开始", "localIP", node.LocalIP, "basePort", node.LocalPort)
+	// 启动TCP监听器（带重试 + 自动端口递增）
+	basePort := node.LocalPort
+	var listener net.Listener
+	var err error
+
+	// First: retry the same port a few times (port may be releasing after restart)
+	tStep := time.Now()
+	for attempt := 0; attempt < 3; attempt++ {
+		addr := fmt.Sprintf("%s:%d", node.LocalIP, node.LocalPort)
+		listener, err = net.Listen("tcp", addr)
+		if err == nil {
+			Log.Debug("TCP监听成功", "addr", addr, "attempt", attempt+1, "耗时", time.Since(tStep))
+			break
+		}
+		Log.Debug("TCP端口被占用，等待重试", "port", node.LocalPort, "attempt", attempt+1, "error", err)
+		time.Sleep(time.Duration(attempt+1) * time.Second)
+	}
+
+	// If still failed, try next ports
 	if err != nil {
+		Log.Debug("TCP主端口全部重试失败，尝试备用端口", "basePort", basePort, "totalRetryTime", time.Since(tStep))
+		for offset := 1; offset <= 10; offset++ {
+			tryPort := basePort + offset
+			addr := fmt.Sprintf("%s:%d", node.LocalIP, tryPort)
+			listener, err = net.Listen("tcp", addr)
+			if err == nil {
+				node.LocalPort = tryPort
+				Log.Debug("TCP使用备用端口", "originalPort", basePort, "actualPort", tryPort)
+				break
+			}
+			Log.Debug("TCP备用端口也被占用", "port", tryPort, "error", err)
+		}
+	}
+	if err != nil {
+		Log.Error("TCP监听全部失败", "error", err, "总耗时", time.Since(tStep))
 		return fmt.Errorf("启动TCP监听失败: %v", err)
 	}
 	node.Listener = listener
 	node.Running = true
 
-	fmt.Printf("P2P节点启动成功: %s:%d\n", node.LocalIP, node.LocalPort)
-	fmt.Printf("节点ID: %s\n", node.ID)
-	fmt.Printf("用户名: %s\n", node.Name)
+	Log.Info("P2P节点启动", "ip", node.LocalIP, "port", node.LocalPort, "name", node.Name, "version", AppVersion)
 
-	// 启动Web GUI
-	if node.WebEnabled {
+	// 启动后台goroutines
+	go node.checkForUpdates()
+	if node.WebEnabled && !node.DesktopMode {
 		node.startWebGUI()
 	}
-
-	// 启动服务发现
 	go node.startDiscovery()
-
-	// 启动mDNS服务发现
-	go node.startMDNSDiscovery()
-
-	// 启动消息处理
 	go node.handleMessages()
-
-	// 启动连接监听
 	go node.acceptConnections()
-
-	// 启动定期广播
 	go node.periodicBroadcast()
 
+	Log.Debug("node.Start() 所有goroutine已启动")
 	return nil
 }
 
@@ -254,8 +315,9 @@ func (node *P2PNode) showCommandHelp() {
 	fmt.Println("  /block <用户名> - 屏蔽用户")
 	fmt.Println("  /unblock <用户名> - 解除屏蔽")
 	fmt.Println("  /acl - 查看屏蔽列表")
-	fmt.Println("  /connect <IP:端口> - 手动连接到指定节点")
 	fmt.Println("  /history [用户名] [数量] - 查看历史消息 (默认20条)")
+	fmt.Println("  /update - 从局域网获取最新版本")
+	fmt.Println("  /version - 显示版本信息")
 	fmt.Println("  /help - 显示帮助信息")
 	fmt.Println("  /quit - 退出程序")
 	fmt.Println("===========================================")
@@ -381,6 +443,12 @@ func (node *P2PNode) handleCommand(command string) {
 		oldName := node.Name
 		node.Name = parts[1]
 		fmt.Printf("用户名已从 %s 更改为 %s\n", oldName, node.Name)
+
+		// Save to config immediately
+		if node.Config != nil {
+			node.Config.Name = node.Name
+			SaveConfig(node.Config)
+		}
 
 		// 广播名称更新消息
 		updateMsg := Message{
@@ -525,9 +593,19 @@ func (node *P2PNode) handleCommand(command string) {
 			fmt.Println("Web界面未启用")
 		}
 		
+	case "/update":
+		node.performUpdate()
+
+	case "/version":
+		channelLabel := "稳定版"
+		if AppChannel() == "test" {
+			channelLabel = "测试版"
+		}
+		fmt.Printf("LANShare %s [%s]\n", AppVersion, channelLabel)
+
 	case "/help":
 		node.showCommandHelp()
-		
+
 	case "/history":
 		chatId := "all"
 		limit := 20
@@ -629,27 +707,6 @@ func (node *P2PNode) handleCommand(command string) {
 			fmt.Println("无历史消息")
 		}
 		
-	case "/connect":
-		if len(parts) < 2 {
-			fmt.Println("用法: /connect <IP:端口>")
-			fmt.Println("示例: /connect 192.168.1.100:8888")
-			return
-		}
-		address := parts[1]
-		host, portStr, err := net.SplitHostPort(address)
-		if err != nil {
-			fmt.Printf("无效的地址格式: %s (应为 IP:端口)\n", address)
-			return
-		}
-		port, err := strconv.Atoi(portStr)
-		if err != nil || port <= 0 || port > 65535 {
-			fmt.Printf("无效的端口号: %s\n", portStr)
-			return
-		}
-		fmt.Printf("正在尝试连接到 %s...\n", address)
-		tempID := fmt.Sprintf("manual_%s_%d", host, time.Now().Unix())
-		go node.connectToPeer(host, port, tempID, "unknown")
-
 	default:
 		fmt.Printf("未知命令: %s\n", parts[0])
 	}
@@ -686,12 +743,19 @@ func (node *P2PNode) cleanupMemory() {
 	}
 }
 
-// 停止节点
+// 停止节点 (idempotent — safe to call multiple times)
 func (node *P2PNode) Stop() {
 	node.Running = false
 
-	// 停止mDNS服务
-	node.stopMDNS()
+	// Signal all goroutines to stop before closing connections.
+	// If StopCh is already closed, this is a duplicate call — bail out.
+	select {
+	case <-node.StopCh:
+		Log.Debug("node.Stop() 重复调用，跳过")
+		return
+	default:
+		close(node.StopCh)
+	}
 
 	if node.Listener != nil {
 		node.Listener.Close()
@@ -712,6 +776,7 @@ func (node *P2PNode) Stop() {
 		node.DB.Close()
 	}
 	fmt.Println("P2P节点已停止")
+	Log.Info("P2P节点已停止", "name", node.Name)
 }
 
 func (node *P2PNode) loadHistoryFromDB() {
@@ -722,13 +787,14 @@ func (node *P2PNode) loadHistoryFromDB() {
 	rows, err := node.DB.Query(`
 		SELECT sender, recipient, content, nonce, is_private, is_own, timestamp,
 			   message_type, message_id, reply_to_id, reply_to_content, reply_to_sender,
-			   file_name, file_size, file_type, file_url, file_data
+			   file_name, file_size, file_type, file_url, file_data, COALESCE(file_id, '')
 		FROM messages
 		ORDER BY timestamp DESC
 		LIMIT 20
 	`)
 	if err != nil {
 		fmt.Printf("加载历史消息失败: %v\n", err)
+		Log.Error("加载历史消息失败", "error", err)
 		return
 	}
 	defer rows.Close()
@@ -744,9 +810,10 @@ func (node *P2PNode) loadHistoryFromDB() {
 
 		var fileURL string
 		var fileData string
+		var fileID string
 		if err := rows.Scan(&sender, &recipient, &content, &nonce, &isPrivate, &isOwn, &ts,
 			&messageType, &messageID, &replyToID, &replyToContent, &replyToSender,
-			&fileName, &fileSize, &fileType, &fileURL, &fileData); err != nil {
+			&fileName, &fileSize, &fileType, &fileURL, &fileData, &fileID); err != nil {
 			continue
 		}
 
@@ -772,6 +839,7 @@ func (node *P2PNode) loadHistoryFromDB() {
 			FileSize:      fileSize,
 			FileType:      fileType,
 			FileURL:       fileURL,
+			FileID:        fileID,
 		}
 		dbMsgs = append(dbMsgs, cm)
 	}
@@ -787,67 +855,129 @@ func (node *P2PNode) loadHistoryFromDB() {
 }
 
 func main() {
+	appStart := time.Now()
 	var name string
 	var cliMode bool
+	var webPort int
 	var showHelp bool
-	
+	var logLevel string
+	var restartDelay int
+
 	flag.StringVar(&name, "name", "", "指定用户名")
-	flag.BoolVar(&cliMode, "cli", false, "仅使用命令行模式")
-	flag.BoolVar(&showHelp, "help", false, "显示此帮助信息")
+	flag.BoolVar(&cliMode, "cli", false, "CLI模式（默认为桌面应用模式）")
+	flag.IntVar(&webPort, "port", 0, "Web/应用端口")
+	flag.BoolVar(&showHelp, "help", false, "显示帮助信息")
+	flag.StringVar(&logLevel, "loglevel", "", "日志级别: error, info, debug")
+	flag.IntVar(&restartDelay, "restart-delay", 0, "启动前等待秒数（重启用）")
 	flag.Parse()
 
-	// 显示帮助信息
+	// Prevent multiple instances.
+	// When restartDelay > 0 (restart scenario), ensureSingleInstance will retry
+	// the mutex acquisition for up to restartDelay seconds, giving the old process
+	// time to fully exit and release the mutex.
+	t := time.Now()
+	cleanup := ensureSingleInstance(restartDelay)
+	defer cleanup()
+	fmt.Printf("单实例检查完成 (%v)\n", time.Since(t))
+
+	// Load persistent config; CLI flags override saved values
+	t = time.Now()
+	cfg := LoadConfig()
+	fmt.Printf("配置加载完成 (%v)\n", time.Since(t))
+	if name != "" {
+		cfg.Name = name
+	}
+	if webPort != 0 {
+		cfg.WebPort = webPort
+	}
+	if logLevel != "" {
+		cfg.LogLevel = logLevel
+	}
+	// Ensure defaults for zero values
+	if cfg.WebPort == 0 {
+		cfg.WebPort = 8080
+	}
+	if cfg.LogLevel == "" {
+		cfg.LogLevel = "debug"
+	}
+
+	dataDir := AppDataDir()
+	fmt.Printf("数据目录: %s\n", dataDir)
+
+	// 清理旧版本遗留文件
+	cleanupOldExecutable()
+
+	t = time.Now()
+	logFile, err := InitLogger(cfg.LogLevel)
+	if err != nil {
+		fmt.Printf("初始化日志失败: %v\n", err)
+	} else {
+		defer logFile.Close()
+	}
+	// From here on, Log.Debug is available
+	Log.Debug("日志系统初始化完成", "耗时", time.Since(t), "级别", cfg.LogLevel)
+	Log.Debug("main() 启动参数", "name", name, "cli", cliMode, "webPort", webPort, "logLevel", logLevel, "restartDelay", restartDelay)
+	Log.Debug("main() 最终配置", "cfgName", cfg.Name, "cfgWebPort", cfg.WebPort, "cfgLogLevel", cfg.LogLevel, "dataDir", dataDir)
+	Log.Debug("main() 预初始化耗时", "elapsed", time.Since(appStart))
+
 	if showHelp {
-		fmt.Println("LANShare P2P - 局域网即时通信工具")
+		fmt.Printf("LANShare P2P v%s [%s] - 局域网即时通信工具\n", AppVersion, AppChannel())
 		fmt.Println()
 		fmt.Println("用法:")
-		fmt.Printf("  %s [选项] [用户名]\n", os.Args[0])
+		fmt.Printf("  %s [选项]\n", os.Args[0])
 		fmt.Println()
 		fmt.Println("选项:")
 		fmt.Println("  -name string    指定用户名")
-		fmt.Println("  -cli            仅使用命令行模式")
+		fmt.Println("  -cli            CLI模式（默认为桌面应用模式）")
+		fmt.Println("  -port int       Web/应用端口 (默认 8080)")
+		fmt.Println("  -loglevel string 日志级别: error, info, debug (默认 error)")
 		fmt.Println("  -help           显示此帮助信息")
 		fmt.Println()
-		fmt.Println("示例:")
-		fmt.Printf("  %s                    # 交互式选择模式\n", os.Args[0])
-		fmt.Printf("  %s -cli               # 命令行模式\n", os.Args[0])
-		fmt.Printf("  %s -name 张三         # 指定用户名\n", os.Args[0])
+		fmt.Println("模式:")
+		fmt.Println("  默认模式: 启动桌面应用（Wails WebView窗口）")
+		fmt.Println("  -cli模式: 命令行界面 + 可选Web界面")
 		fmt.Println()
-		fmt.Println("Web 界面: 在 CLI 模式下使用 /web 命令启用")
 		fmt.Println("网络端口:")
 		fmt.Println("  P2P通信: 8888 (TCP)")
 		fmt.Println("  服务发现: 9999 (UDP)")
+		fmt.Println()
+		fmt.Printf("数据目录: %s\n", AppDataDir())
 		return
 	}
 
-	fmt.Println("===========================================")
-	fmt.Println("           LANShare P2P 启动器")
-	fmt.Println("===========================================")
-
-	// 默认不启用 Web 模式
-	webMode := false
-
-	// 获取用户名
-	if name == "" {
+	if cfg.Name == "" {
 		if len(flag.Args()) > 0 {
-			name = flag.Args()[0]
-		} else {
-			fmt.Print("请输入您的用户名 (留空使用默认): ")
-			var inputName string
-			fmt.Scanln(&inputName)
-			if inputName != "" {
-				name = inputName
-			} else {
-				name = "用户_" + strconv.Itoa(int(time.Now().Unix()%10000))
-			}
+			cfg.Name = flag.Args()[0]
 		}
 	}
 
-	// 先选择网络接口
+	if cliMode {
+		startCLIMode(cfg)
+	} else {
+		startDesktopMode(cfg)
+	}
+}
+
+// CLI模式启动（保留交互式提示）
+func startCLIMode(cfg *AppConfig) {
+	fmt.Println("===========================================")
+	fmt.Println("           LANShare P2P 启动器 (CLI)")
+	fmt.Println("===========================================")
+
+	if cfg.Name == "" {
+		fmt.Print("请输入您的用户名 (留空使用默认): ")
+		var inputName string
+		fmt.Scanln(&inputName)
+		if inputName != "" {
+			cfg.Name = inputName
+		} else {
+			cfg.Name = "用户_" + strconv.Itoa(int(time.Now().Unix()%10000))
+		}
+	}
+
 	localIP := getLocalIP()
 
-	// 然后选择Web模式
-	webMode = false
+	webMode := false
 	fmt.Print("是否启用Web界面? (y/N): ")
 	var webInput string
 	fmt.Scanln(&webInput)
@@ -855,10 +985,13 @@ func main() {
 		webMode = true
 	}
 
-	node := NewP2PNode(name, webMode, localIP)
-	
+	node := NewP2PNode(cfg.Name, webMode, localIP)
+	node.Config = cfg
+	node.clearHistoryIfDisabled()
+
 	if webMode {
-		fmt.Print("请输入Web端口 (默认8080): ")
+		node.WebPort = cfg.WebPort
+		fmt.Print("请输入Web端口 (默认" + strconv.Itoa(cfg.WebPort) + "): ")
 		var portInput string
 		fmt.Scanln(&portInput)
 		if portInput != "" {
@@ -866,16 +999,318 @@ func main() {
 				node.WebPort = port
 				fmt.Printf("Web端口设置为: %d\n", port)
 			} else {
-				fmt.Println("无效端口，使用默认8080")
+				fmt.Println("无效端口，使用默认端口")
 			}
 		}
 	}
-	
+
+	// Apply blocked users from config
+	applyBlockedUsers(node, cfg)
+
 	if err := node.Start(); err != nil {
 		fmt.Printf("启动P2P节点失败: %v\n", err)
+		Log.Error("启动P2P节点失败", "error", err, "mode", "cli")
 		return
 	}
 
-	// 启动命令行界面
+	// Save config with current name
+	cfg.Name = node.Name
+	cfg.WebPort = node.WebPort
+	SaveConfig(cfg)
+
 	node.startCLI()
+}
+
+// applyBlockedUsers restores blocked users from config into the node's ACL.
+func applyBlockedUsers(node *P2PNode, cfg *AppConfig) {
+	if len(cfg.BlockedUsers) == 0 {
+		return
+	}
+	node.ACLMutex.Lock()
+	defer node.ACLMutex.Unlock()
+	if node.ACLs[node.Address] == nil {
+		node.ACLs[node.Address] = make(map[string]bool)
+	}
+	for _, addr := range cfg.BlockedUsers {
+		node.ACLs[node.Address][addr] = false
+	}
+}
+
+// collectBlockedUsers extracts blocked user addresses from the node's ACL.
+func collectBlockedUsers(node *P2PNode) []string {
+	node.ACLMutex.RLock()
+	defer node.ACLMutex.RUnlock()
+	var blocked []string
+	if acl, exists := node.ACLs[node.Address]; exists {
+		for addr, allowed := range acl {
+			if !allowed {
+				blocked = append(blocked, addr)
+			}
+		}
+	}
+	return blocked
+}
+
+// 桌面应用模式启动（Wails）
+func startDesktopMode(cfg *AppConfig) {
+	tDesktop := time.Now()
+
+	hostname, _ := os.Hostname()
+	if cfg.Name == "" {
+		if hostname != "" {
+			cfg.Name = hostname
+		} else {
+			cfg.Name = "用户_" + strconv.Itoa(int(time.Now().Unix()%10000))
+		}
+	}
+	Log.Debug("桌面模式: 用户名确定", "name", cfg.Name, "hostname", hostname)
+
+	tStep := time.Now()
+	localIP := getLocalIPAuto()
+	Log.Debug("桌面模式: 本地IP获取", "耗时", time.Since(tStep), "localIP", localIP)
+
+	tStep = time.Now()
+	node := NewP2PNode(cfg.Name, true, localIP)
+	Log.Debug("桌面模式: NewP2PNode 返回", "耗时", time.Since(tStep))
+
+	node.DesktopMode = true
+	node.Config = cfg
+	node.clearHistoryIfDisabled()
+	node.WebPort = cfg.WebPort
+
+	applyBlockedUsers(node, cfg)
+	Log.Debug("桌面模式: 屏蔽列表已应用", "blockedCount", len(cfg.BlockedUsers))
+
+	// Persist config immediately so it survives non-graceful exits (e.g., Task Manager kill, crash, PC reboot).
+	// Without this, users who never do a graceful exit lose their generated name/port on every launch.
+	if err := SaveConfig(cfg); err != nil {
+		Log.Error("初始配置保存失败", "error", err)
+	} else {
+		Log.Debug("桌面模式: 初始配置已保存", "path", configPath())
+	}
+
+	app := NewDesktopApp(node, cfg)
+
+	tStep = time.Now()
+	app.initSystray()
+	Log.Debug("桌面模式: initSystray 完成", "耗时", time.Since(tStep))
+
+	tStep = time.Now()
+	webviewPaths := buildWebViewPathCandidates(localIP, cfg.WebPort)
+	pathLabels := make([]string, len(webviewPaths))
+	for i, wp := range webviewPaths {
+		pathLabels[i] = wp.label
+	}
+	Log.Debug("桌面模式: WebView2候选路径", "耗时", time.Since(tStep), "candidates", pathLabels)
+
+	Log.Debug("桌面模式: wails.Run 之前总耗时", "elapsed", time.Since(tDesktop))
+
+	var lastErr error
+	for i, wp := range webviewPaths {
+		label := wp.label
+		path := wp.path
+		Log.Debug("桌面模式: 尝试启动 Wails", "strategy", label, "path", path, "attempt", i+1, "windowSize", fmt.Sprintf("%dx%d", cfg.WindowWidth, cfg.WindowHeight))
+		tWails := time.Now()
+
+		lastErr = wails.Run(&options.App{
+			Title:             "LS Messager",
+			Width:             cfg.WindowWidth,
+			Height:            cfg.WindowHeight,
+			MinWidth:          380,
+			MinHeight:         400,
+			HideWindowOnClose: true,
+			AssetServer: &assetserver.Options{
+				Handler: app.APIHandler(),
+			},
+			DragAndDrop: &options.DragAndDrop{
+				EnableFileDrop:     true,
+				DisableWebViewDrop: true,
+				CSSDropProperty:    "--wails-drop-target",
+				CSSDropValue:       "drop",
+			},
+			Windows: &windows.Options{
+				WebviewIsTransparent:                false,
+				WindowIsTranslucent:                 false,
+				WebviewBrowserPath:                  path,
+				WebviewDisableRendererCodeIntegrity: true,
+				CustomTheme: &windows.ThemeSettings{
+					// Dark mode (Telegram skin): standard dark title bar
+					DarkModeTitleBar:           windows.RGB(23, 33, 43),
+					DarkModeTitleBarInactive:   windows.RGB(23, 33, 43),
+					DarkModeTitleText:          windows.RGB(200, 200, 200),
+					DarkModeTitleTextInactive:  windows.RGB(120, 120, 120),
+					DarkModeBorder:             windows.RGB(23, 33, 43),
+					DarkModeBorderInactive:     windows.RGB(23, 33, 43),
+					// Light mode (WiseTalk skin): blue title bar (#0089FF)
+					LightModeTitleBar:          windows.RGB(0, 137, 255),
+					LightModeTitleBarInactive:  windows.RGB(0, 106, 200),
+					LightModeTitleText:         windows.RGB(255, 255, 255),
+					LightModeTitleTextInactive: windows.RGB(200, 220, 255),
+					LightModeBorder:            windows.RGB(0, 137, 255),
+					LightModeBorderInactive:    windows.RGB(0, 106, 200),
+				},
+			},
+			OnStartup:  app.startup,
+			OnDomReady: app.onDomReady,
+			OnShutdown: app.shutdown,
+			Bind:       []interface{}{app},
+		})
+		if lastErr == nil {
+			Log.Debug("桌面模式: wails.Run 正常退出", "strategy", label, "运行时长", time.Since(tWails))
+			return
+		}
+		Log.Warn("Wails 启动失败，尝试下一策略", "strategy", label, "error", lastErr, "耗时", time.Since(tWails))
+	}
+
+	// 所有策略都失败
+	fmt.Printf("所有启动策略均失败: %v\n", lastErr)
+	Log.Error("所有 WebView2 策略均失败", "error", lastErr)
+	errSplash := NewBootstrapSplash()
+	errMsg := fmt.Sprintf("启动失败: %v\n\n请尝试以下方案：\n1. 确保局域网中有其他域信节点在运行后重试\n2. 手动下载 WebView2 运行时:\n   https://developer.microsoft.com/en-us/microsoft-edge/webview2/\n3. 使用 -cli 参数启动命令行模式", lastErr)
+	errSplash.ShowError(errMsg)
+}
+
+// webviewCandidate represents one WebView2 startup strategy.
+type webviewCandidate struct {
+	label string // human-readable description
+	path  string // WebviewBrowserPath ("" = system auto-detect)
+}
+
+// buildWebViewPathCandidates returns an ordered list of WebView2 paths to try.
+// Priority: system auto-detect → local Fixed Version → LAN bootstrap → empty (last resort).
+func buildWebViewPathCandidates(localIP string, webPort int) []webviewCandidate {
+	var candidates []webviewCandidate
+
+	tStep := time.Now()
+	systemInstalled := isWebView2SystemInstalled()
+	Log.Debug("WebView2系统检测", "耗时", time.Since(tStep), "installed", systemInstalled)
+
+	tStep = time.Now()
+	localPath := detectWebView2Runtime()
+	Log.Debug("WebView2本地检测", "耗时", time.Since(tStep), "localPath", localPath)
+
+	if systemInstalled {
+		// 策略1: 系统 WebView2（空路径，Wails 自动查找）
+		candidates = append(candidates, webviewCandidate{
+			label: "系统 WebView2 (自动检测)",
+			path:  "",
+		})
+	}
+
+	if localPath != "" {
+		// 策略2: 本地 Fixed Version（exe 旁边的 WebView2Runtime/）
+		candidates = append(candidates, webviewCandidate{
+			label: fmt.Sprintf("本地 Fixed Version (%s)", localPath),
+			path:  localPath,
+		})
+	}
+
+	if !systemInstalled && localPath == "" {
+		// 没有任何 WebView2，先尝试从局域网获取
+		splash := NewBootstrapSplash()
+		splash.Show()
+		splash.SetText("正在从内网搜索必须的运行时，请稍候...")
+
+		if bootstrapWebView2(localIP, webPort, splash) {
+			splash.Close()
+			if bootstrapPath := detectWebView2Runtime(); bootstrapPath != "" {
+				candidates = append(candidates, webviewCandidate{
+					label: fmt.Sprintf("局域网获取 (%s)", bootstrapPath),
+					path:  bootstrapPath,
+				})
+			}
+		} else {
+			splash.Close()
+			Log.Warn("WebView2 局域网引导失败")
+			fmt.Println("局域网未找到可用运行时")
+		}
+	}
+
+	// 最后兜底：空路径直接尝试（某些系统可能通过非标准途径提供 WebView2）
+	if len(candidates) == 0 || (len(candidates) > 0 && candidates[0].path != "") {
+		// 确保空路径在候选列表中（如果还没有的话）
+		hasEmpty := false
+		for _, c := range candidates {
+			if c.path == "" {
+				hasEmpty = true
+				break
+			}
+		}
+		if !hasEmpty {
+			candidates = append(candidates, webviewCandidate{
+				label: "直接启动 (兜底方案)",
+				path:  "",
+			})
+		}
+	}
+
+	return candidates
+}
+
+// detectWebView2Runtime 检测 exe 同目录下的 WebView2Runtime/ 文件夹
+// WebviewBrowserPath 需要指向包含 msedgewebview2.exe 的目录
+func detectWebView2Runtime() string {
+	exePath, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	exeDir := filepath.Dir(exePath)
+	wv2Dir := filepath.Join(exeDir, "WebView2Runtime")
+
+	info, err := os.Stat(wv2Dir)
+	if err != nil || !info.IsDir() {
+		return ""
+	}
+
+	// Check if msedgewebview2.exe is directly in WebView2Runtime/
+	if _, err := os.Stat(filepath.Join(wv2Dir, "msedgewebview2.exe")); err == nil {
+		fmt.Printf("检测到本地 WebView2 运行时: %s\n", wv2Dir)
+		return wv2Dir
+	}
+
+	// Check subdirectories (CAB extraction creates a version-named subfolder)
+	entries, err := os.ReadDir(wv2Dir)
+	if err != nil {
+		return ""
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			subDir := filepath.Join(wv2Dir, entry.Name())
+			if _, err := os.Stat(filepath.Join(subDir, "msedgewebview2.exe")); err == nil {
+				fmt.Printf("检测到本地 WebView2 运行时: %s\n", subDir)
+				return subDir
+			}
+		}
+	}
+
+	return ""
+}
+
+// 自动选择本地IP（非交互式，用于桌面模式）
+func getLocalIPAuto() string {
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return "127.0.0.1"
+	}
+
+	for _, iface := range interfaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+
+		for _, addr := range addrs {
+			if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
+				if ipnet.IP.To4() != nil {
+					return ipnet.IP.String()
+				}
+			}
+		}
+	}
+
+	return "127.0.0.1"
 }

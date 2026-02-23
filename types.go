@@ -2,11 +2,13 @@ package main
 
 import (
 	"database/sql"
-	_ "github.com/mattn/go-sqlite3"
 	"net"
 	"net/http"
 	"sync"
 	"time"
+
+	"github.com/hashicorp/mdns"
+	_ "modernc.org/sqlite"
 )
 
 // P2PNode结构体 - 主节点结构
@@ -22,10 +24,12 @@ type P2PNode struct {
 	PeersMutex sync.RWMutex
 
 	MessageChan chan Message
+	StopCh      chan struct{} // Closed on shutdown to signal all goroutines
 	Running     bool
 
 	DiscoveryPort int
 	BroadcastConn *net.UDPConn
+	MdnsServer    *mdns.Server
 
 	// Web GUI相关
 	WebPort      int
@@ -42,12 +46,29 @@ type P2PNode struct {
 	DB                *sql.DB
 	LocalDBKey        [32]byte
 
-	// mDNS 服务发现
-	MdnsServer    interface{ Shutdown() error } // *mdns.Server, use interface to avoid import
-	BroadcastAddr string                         // 计算出的子网广播地址
+	// Node-level ECDH keys (persistent for node lifetime)
+	NodePrivateKey [32]byte
+	NodePublicKey  [32]byte
 
 	// 内存管理
 	lastCleanupTime   time.Time
+
+	// Desktop mode (Wails)
+	DesktopMode       bool
+	OnNewMessage      func(ChatMessage)
+	OnUserOnline      func(string)
+	OnUserOffline     func(string)
+	OnUpdateAvailable func(updateSource)
+	OnBeforeRestart   func() // Called before restart to clean up desktop resources
+	OnQuitApp         func() // Called to properly quit the app (triggers Wails shutdown)
+
+	// Auto-update
+	AvailableUpdate *updateSource
+	UpdateStatus    string // "", "downloading", "completed", "failed"
+	UpdateError     string
+
+	// Config reference for runtime settings
+	Config *AppConfig
 }
 
 // Peer结构体 - 对等节点结构
@@ -56,15 +77,16 @@ type Peer struct {
 	Name          string
 	Address       string
 	Conn          net.Conn
+	WriteMutex    sync.Mutex // 保护TCP连接写入，防止并发写入破坏JSON流
 	IsActive      bool
 	LastSeen      time.Time
-	SharedKey     []byte    // 新增：共享密钥
-	PrivateKey    [32]byte  // 临时私钥
-	PublicKey     [32]byte  // 临时公钥
+	SharedKey     []byte    // 共享密钥 (derived from node private + peer public)
+	PublicKey     [32]byte  // 对端公钥 (remote peer's public key)
 	ReconnectAttempts int   // 重连尝试次数
 	LastReconnectTime time.Time // 上次重连尝试时间
 	IP            string    // IP地址
 	Port          int       // 端口号
+	WebPort       int       // HTTP端口号（用于更新检查等）
 }
 
 // Message结构体 - 通用消息结构
@@ -91,15 +113,19 @@ type Message struct {
 	FileType       string `json:"fileType,omitempty"`       // 文件类型
 	FileURL        string `json:"fileUrl,omitempty"`        // 文件URL
 	FileData       string `json:"fileData,omitempty"`       // 文件base64数据（用于图片等小文件）
+	FileID         string `json:"fileId,omitempty"`         // 文件传输ID（关联FileTransferStatus）
 }
 
 // DiscoveryMessage结构体 - 服务发现消息结构
 type DiscoveryMessage struct {
-	Type string `json:"type"`
-	ID   string `json:"id"`
-	Name string `json:"name"`
-	IP   string `json:"ip"`
-	Port int    `json:"port"`
+	Type    string `json:"type"`
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	IP      string `json:"ip"`
+	Port    int    `json:"port"`
+	WebPort int    `json:"webPort,omitempty"` // HTTP port for LAN sharing
+	Version string `json:"version,omitempty"` // App version for auto-update
+	PubKey  []byte `json:"pubKey,omitempty"`  // Node public key for ECDH
 }
 
 // ChatMessage结构体 - 聊天消息结构
@@ -121,6 +147,7 @@ type ChatMessage struct {
 	FileSize       int64  `json:"fileSize,omitempty"`       // 文件大小
 	FileType       string `json:"fileType,omitempty"`       // 文件类型
 	FileURL        string `json:"fileUrl,omitempty"`        // 文件URL（用于Web界面）
+	FileID         string `json:"fileId,omitempty"`         // 文件传输ID（关联FileTransferStatus）
 }
 
 // FileTransferRequest结构体 - 文件传输请求
@@ -178,6 +205,21 @@ type FileTransferStatus struct {
 	Speed          float64   `json:"speed"`          // 传输速度 (bytes/second)
 	ETA            int64     `json:"eta"`            // 预计剩余时间 (seconds)
 	LastUpdateTime time.Time `json:"-"`              // 上次更新时间，用于计算速度
+	SavePath       string    `json:"savePath,omitempty"` // 接收文件保存路径
+}
+
+// 应用版本
+// Stable: "1.0.0", "1.1.0"  |  Test: "1.0.1-beta", "1.1.0-rc1", "2.0.0-dev"
+const AppVersion = "1.2.27-dev"
+
+// AppChannel returns "stable" or "test" based on the version string.
+func AppChannel() string {
+	for _, c := range AppVersion {
+		if c == '-' {
+			return "test"
+		}
+	}
+	return "stable"
 }
 
 // 消息类型常量
